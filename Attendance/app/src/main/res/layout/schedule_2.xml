@@ -284,92 +284,13 @@
                     </TableRow>
                 </TableLayout>
 
-                <!-- 백엔드 시간표 데이터를 받아서 과목 블록을 올릴 영역 -->
+                <!-- 백엔드 시간표 데이터를 받아서 과목 블록을 올릴 영역 (Room DB → 동적 생성) -->
                 <FrameLayout
                     android:id="@+id/classBlockLayer"
                     android:layout_width="match_parent"
                     android:layout_height="match_parent"
                     android:paddingStart="26dp"
-                    android:paddingTop="22dp">
-
-                    <!-- 미리보기용 과목 블록: Kotlin 연결 후 백엔드 데이터로 동적 생성 가능 -->
-
-                    <TextView
-                        android:id="@+id/blockDataStructureTue"
-                        android:layout_width="58dp"
-                        android:layout_height="48dp"
-                        android:layout_marginStart="58dp"
-                        android:layout_marginTop="48dp"
-                        android:background="#8FA2C7"
-                        android:fontFamily="@font/pretendard_bold"
-                        android:gravity="center"
-                        android:padding="3dp"
-                        android:text="자료구조\n및 실습 (\n영어강의)"
-                        android:textColor="#FFFFFF"
-                        android:textSize="10sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:id="@+id/blockDataStructureThu"
-                        android:layout_width="58dp"
-                        android:layout_height="96dp"
-                        android:layout_marginStart="174dp"
-                        android:layout_marginTop="48dp"
-                        android:background="#8FA2C7"
-                        android:fontFamily="@font/pretendard_bold"
-                        android:gravity="center"
-                        android:padding="3dp"
-                        android:text="자료구조\n및 실습 (\n영어강의)\nAI관-511"
-                        android:textColor="#FFFFFF"
-                        android:textSize="10sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:id="@+id/blockSoftwareFri"
-                        android:layout_width="58dp"
-                        android:layout_height="144dp"
-                        android:layout_marginStart="232dp"
-                        android:layout_marginTop="48dp"
-                        android:background="#79B2B8"
-                        android:fontFamily="@font/pretendard_bold"
-                        android:gravity="center"
-                        android:padding="3dp"
-                        android:text="소프트웨\n어공학 (신\n기술화상\n강의)\n화상강의\n의실 (가상)"
-                        android:textColor="#FFFFFF"
-                        android:textSize="10sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:id="@+id/blockMobileTue"
-                        android:layout_width="58dp"
-                        android:layout_height="48dp"
-                        android:layout_marginStart="58dp"
-                        android:layout_marginTop="240dp"
-                        android:background="#B9AAA5"
-                        android:fontFamily="@font/pretendard_bold"
-                        android:gravity="center"
-                        android:padding="3dp"
-                        android:text="모바일프로\n그래밍 (영\n어강의)"
-                        android:textColor="#FFFFFF"
-                        android:textSize="10sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:id="@+id/blockMobileThu"
-                        android:layout_width="58dp"
-                        android:layout_height="96dp"
-                        android:layout_marginStart="174dp"
-                        android:layout_marginTop="192dp"
-                        android:background="#B9AAA5"
-                        android:fontFamily="@font/pretendard_bold"
-                        android:gravity="center"
-                        android:padding="3dp"
-                        android:text="모바일프로\n그래밍 (영\n어강의)\nAI관-301"
-                        android:textColor="#FFFFFF"
-                        android:textSize="10sp"
-                        android:textStyle="bold" />
-
-                </FrameLayout>
+                    android:paddingTop="22dp" />
             </FrameLayout>
         </androidx.cardview.widget.CardView>
 

@@ -53,6 +53,8 @@ dependencies {
     implementation(libs.androidx.constraintlayout)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.recyclerview)
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
 
     // ── Compose (gachon base) ──
     implementation(libs.androidx.activity.compose)
@@ -79,8 +81,9 @@ dependencies {
     implementation(libs.androidx.core.uwb)
 
     // ── Firebase (Realtime Database for schedule sync) ──
-    implementation(platform(libs.firebase.bom))
-    implementation(libs.firebase.database.ktx)
+    implementation(platform("com.google.firebase:firebase-bom:34.12.0"))
+    implementation("com.google.firebase:firebase-analytics")
+    implementation("com.google.firebase:firebase-database")
 
     // ── Room (시간표 로컬 영구 저장) ──
     implementation(libs.androidx.room.runtime)

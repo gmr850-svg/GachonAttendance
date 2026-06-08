@@ -1,6 +1,5 @@
 package com.example.myapplication
 
-import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.graphics.Color
@@ -17,19 +16,31 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.GravityCompat
 import androidx.drawerlayout.widget.DrawerLayout
+import androidx.lifecycle.lifecycleScope
 import com.example.myapplication.launcher.AttendanceServiceLauncher
+import com.example.myapplication.model.data.repository.AttendanceRepositoryImpl
+import com.example.myapplication.model.domain.model.Subject
+import com.google.firebase.database.DataSnapshot
+import com.google.firebase.database.DatabaseError
+import com.google.firebase.database.DatabaseReference
+import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.database.ValueEventListener
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
-class MainActivity : Activity() {
+class MainActivity : AppCompatActivity() {
 
     private lateinit var drawerLayout: DrawerLayout
     private lateinit var contentFrame: FrameLayout
+
+    private val repository = AttendanceRepositoryImpl()
 
     private var currentPageResId: Int = R.layout.main1
     private var userId: String = ""
@@ -44,7 +55,11 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private var pinPopupShowing = false
     private var uwbRunnable: Runnable? = null
-    private var attendanceRefreshRunnable: Runnable? = null
+
+    private var attendanceRecordListener: ValueEventListener? = null
+    private var attendanceSessionListener: ValueEventListener? = null
+    private var activeRecordRef: DatabaseReference? = null
+    private var activeSessionRef: DatabaseReference? = null
 
     /** 출석 Service trigger + 권한 흐름 + Service→Activity broadcast 수신 헬퍼. */
     private lateinit var launcher: AttendanceServiceLauncher
@@ -75,7 +90,6 @@ class MainActivity : Activity() {
         drawerLayout = findViewById(R.id.drawerLayout)
         contentFrame = findViewById(R.id.contentFrame)
 
-        // 출석 Service 통합 헬퍼 — 권한/Service trigger/broadcast 수신 캡슐화
         launcher = AttendanceServiceLauncher(this)
         launcher.setListener(sessionListener)
         launcher.requestStartupPermissions()
@@ -111,71 +125,39 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         uwbRunnable?.let { handler.removeCallbacks(it) }
-        attendanceRefreshRunnable?.let { handler.removeCallbacks(it) }
         phaseTransitionRunnable?.let { handler.removeCallbacks(it) }
+        removeRecordListener()
+        removeSessionListener()
     }
 
-    /**
-     * AttendanceServiceLauncher → MainActivity broadcast 수신 콜백.
-     *
-     * dual-write 구조에서 server가 RTDB에 데이터 mirror하므로 그쪽 화면(FirebaseClient.get 기반)이
-     * 다음 refresh 시 자동 반영됨. 여기선 Toast / 즉시 UI 갱신만 담당.
-     */
     private val sessionListener = object : AttendanceServiceLauncher.SessionEventsListener {
-        // 교수: /start 성공 — 받은 4자리 PIN을 즉시 UI에 표시
         override fun onSessionStarted(sessionCode: String?, lectureSessionId: String?) {
             val pageView = contentFrame.getChildAt(0) ?: return
             showPin(pageView, sessionCode ?: "")
-            Toast.makeText(
-                this@MainActivity,
-                "출석체크가 시작되었습니다 (PIN: $sessionCode)",
-                Toast.LENGTH_SHORT
-            ).show()
+            Toast.makeText(this@MainActivity, "출석체크가 시작되었습니다 (PIN: $sessionCode)", Toast.LENGTH_SHORT).show()
         }
 
-        // 교수: /start 실패 또는 학생: check-in 실패
         override fun onSessionFailed(reason: String?) {
             Toast.makeText(this@MainActivity, "출석 시작 실패: $reason", Toast.LENGTH_LONG).show()
         }
 
-        // 교수: 5분 BLE 광고 종료 (Service는 계속 살아있음 — PIN 수동 입력 계속 가능)
         override fun onSessionExpired() {
-            Toast.makeText(
-                this@MainActivity,
-                "BLE 광고 종료 (PIN 수동 입력 계속 가능)",
-                Toast.LENGTH_SHORT
-            ).show()
+            Toast.makeText(this@MainActivity, "BLE 광고 종료 (PIN 수동 입력 계속 가능)", Toast.LENGTH_SHORT).show()
         }
 
-        // 학생: BLE 또는 PIN으로 출석 등록 성공
         override fun onAttendanceConfirmed(sessionCode: String?) {
             val pageView = contentFrame.getChildAt(0) ?: return
-
-            updateStudentAttendanceUi(
-                pageView = pageView,
-                statusText = "출석 완료",
-                isCompleted = true
-            )
-
+            updateStudentAttendanceUi(pageView, "출석 완료", true)
             Toast.makeText(this@MainActivity, "출석 처리되었습니다", Toast.LENGTH_SHORT).show()
-            refreshStudentAttendanceButtonState(pageView)
         }
 
-        // 학생: check-in 실패 (잘못된 PIN / 미수강 등)
         override fun onAttendanceFailed(reason: String?) {
             Toast.makeText(this@MainActivity, "출석 실패: $reason", Toast.LENGTH_LONG).show()
         }
 
-        // 학생: UWB ranging 3회 연속 실패 → ABSENT
         override fun onAttendanceAbsent(attendanceId: String?) {
             val pageView = contentFrame.getChildAt(0) ?: return
-
-            updateStudentAttendanceUi(
-                pageView = pageView,
-                statusText = "결석",
-                isCompleted = false
-            )
-
+            updateStudentAttendanceUi(pageView, "결석", false)
             AlertDialog.Builder(this@MainActivity)
                 .setTitle("결석 처리")
                 .setMessage("UWB 재실 검증에 3회 연속 실패하여 결석 처리되었습니다.")
@@ -193,8 +175,10 @@ class MainActivity : Activity() {
 
     private fun loadPage(layoutResId: Int) {
         currentPageResId = layoutResId
-        attendanceRefreshRunnable?.let { handler.removeCallbacks(it) }
-        attendanceRefreshRunnable = null
+
+        // 페이지가 바뀔 때마다 기존에 걸어둔 실시간 감지 리스너 해제 (메모리 누수 방지)
+        removeRecordListener()
+        removeSessionListener()
         contentFrame.removeAllViews()
 
         val pageView = LayoutInflater.from(this).inflate(layoutResId, contentFrame, false)
@@ -209,9 +193,7 @@ class MainActivity : Activity() {
         when (layoutResId) {
             R.layout.main1 -> {
                 loadCurrentClass(pageView)
-                setupStudentAttendanceButton(pageView)
             }
-
             R.layout.main_p_1 -> {
                 loadProfessorPage(pageView)
                 pageView.findViewById<View?>(R.id.btnProfessorAttendanceCheck)?.setOnClickListener {
@@ -221,24 +203,13 @@ class MainActivity : Activity() {
                     Toast.makeText(this, "호명출석 기능은 출석체크 시작 전만 사용할 수 있습니다", Toast.LENGTH_SHORT).show()
                 }
             }
-
-            R.layout.schedule_1 -> {
-                loadSchedule(pageView)
-            }
-
+            R.layout.schedule_1 -> loadSchedule(pageView)
             R.layout.mypage -> {
                 loadMyPage(pageView)
                 loadSchedule(pageView)
             }
-
-            R.layout.week_1,
-            R.layout.week_2 -> {
-                loadAttendanceCalendar(pageView)
-            }
-
-            R.layout.all_attendance -> {
-                loadAttendanceSummary(pageView)
-            }
+            R.layout.week_1, R.layout.week_2 -> loadAttendanceCalendar(pageView)
+            R.layout.all_attendance -> loadAttendanceSummary(pageView)
         }
     }
 
@@ -255,34 +226,14 @@ class MainActivity : Activity() {
         val btnSchedule = pageView.findViewById<View?>(R.id.btnBottomSchedule)
         val btnLogout = pageView.findViewById<View?>(R.id.btnBottomLogout)
 
-        btnHome?.setOnClickListener {
-            if (userRole == "professor") {
-                loadPage(R.layout.main_p_1)
-            } else {
-                loadPage(R.layout.main1)
-            }
-        }
-
+        btnHome?.setOnClickListener { if (userRole == "professor") loadPage(R.layout.main_p_1) else loadPage(R.layout.main1) }
         btnRefresh?.setOnClickListener {
             loadPage(currentPageResId)
             Toast.makeText(this, "새로고침되었습니다", Toast.LENGTH_SHORT).show()
         }
-
-        btnNotice?.setOnClickListener {
-            if (userRole == "professor") {
-                loadPage(R.layout.notice_2)
-            } else {
-                loadPage(R.layout.notice_1)
-            }
-        }
-
-        btnSchedule?.setOnClickListener {
-            loadPage(R.layout.schedule_1)
-        }
-
-        btnLogout?.setOnClickListener {
-            logout()
-        }
+        btnNotice?.setOnClickListener { if (userRole == "professor") loadPage(R.layout.notice_2) else loadPage(R.layout.notice_1) }
+        btnSchedule?.setOnClickListener { loadPage(R.layout.schedule_1) }
+        btnLogout?.setOnClickListener { logout() }
     }
 
     private fun setupDrawerMenuClick() {
@@ -295,11 +246,9 @@ class MainActivity : Activity() {
         findViewById<View?>(R.id.menuAllAttendance)?.setOnClickListener { moveTo(R.layout.all_attendance) }
         findViewById<View?>(R.id.menuConfirmPeriod)?.setOnClickListener { moveTo(R.layout.confirm_1) }
         findViewById<View?>(R.id.menuConfirmOfficial)?.setOnClickListener { moveTo(R.layout.confirm_2) }
-
         findViewById<View?>(R.id.menuNotice)?.setOnClickListener {
             if (userRole == "professor") moveTo(R.layout.notice_2) else moveTo(R.layout.notice_1)
         }
-
         findViewById<View?>(R.id.menuCancel)?.setOnClickListener {
             if (userRole == "professor") moveTo(R.layout.cancel_2) else moveTo(R.layout.cancel_1)
         }
@@ -311,54 +260,180 @@ class MainActivity : Activity() {
     }
 
     private fun loadCurrentClass(pageView: View) {
+        val calendar = Calendar.getInstance(Locale.KOREA)
+        val currentDayInt = when (calendar.get(Calendar.DAY_OF_WEEK)) {
+            Calendar.MONDAY -> 1; Calendar.TUESDAY -> 2; Calendar.WEDNESDAY -> 3
+            Calendar.THURSDAY -> 4; Calendar.FRIDAY -> 5; Calendar.SATURDAY -> 6; Calendar.SUNDAY -> 7; else -> 1
+        }
+        val nowStr = SimpleDateFormat("HH:mm", Locale.KOREA).format(Date())
+
+        fun timeToMinutes(timeStr: String): Int {
+            val parts = timeStr.split(":")
+            val h = parts.getOrNull(0)?.toIntOrNull() ?: 0
+            val m = parts.getOrNull(1)?.toIntOrNull() ?: 0
+            return h * 60 + m
+        }
+
+        // 위쪽 UI 초기화
+        pageView.findViewById<TextView>(R.id.tvDate)?.text = todayText()
+        pageView.findViewById<TextView>(R.id.tvClassName)?.text = "시간표 분석 중..."
+        pageView.findViewById<TextView>(R.id.tvClassTime)?.text = "-"
+        pageView.findViewById<TextView>(R.id.tvPeriod)?.text = "-"
+
+        // 아래쪽 UI 초기화
+        pageView.findViewById<TextView>(R.id.tvDetailClassName)?.text = "분석 중..."
+        pageView.findViewById<TextView>(R.id.tvDetailProfessor)?.text = "-"
+        pageView.findViewById<TextView>(R.id.tvDetailTime)?.text = "-"
+        pageView.findViewById<TextView>(R.id.tvDetailRoom)?.text = "-"
+
         FirebaseClient.get("Enrollment/$userId") { enrollmentJson ->
-            val subjectCode = enrollmentJson?.keys()?.asSequence()?.firstOrNull()
+            val subjectCodes = mutableListOf<String>()
+            val keys = enrollmentJson?.keys()
+            if (keys != null) {
+                while (keys.hasNext()) subjectCodes.add(keys.next())
+            }
 
-            if (subjectCode.isNullOrBlank()) {
-                setText(pageView, "tvDate", todayText())
-                setText(pageView, "tvPeriod", "현재 수업 없음")
-
-                updateStudentAttendanceUi(
-                    pageView = pageView,
-                    statusText = "미출석",
-                    isCompleted = false
-                )
+            if (subjectCodes.isEmpty()) {
+                runOnUiThread {
+                    pageView.findViewById<TextView>(R.id.tvClassName)?.text = "수강 신청 내역 없음"
+                    updateStudentAttendanceUi(pageView, "미출석", false)
+                }
                 return@get
             }
 
-            currentSubjectCode = subjectCode
+            class ClassInstance(
+                val subjectCode: String, val subjectName: String, val profName: String,
+                val location: String, val fullScheduleStr: String,
+                val dayOfWeekInt: Int, val startTime: String, val endTime: String
+            )
 
-            FirebaseClient.get("Subjects/$subjectCode") { subjectJson ->
-                val subject = FirebaseParsers.subject(subjectJson, subjectCode)
+            val allClasses = mutableListOf<ClassInstance>()
+            var fetchCount = 0
+            val lock = Any()
 
-                if (subject == null) {
-                    setText(pageView, "tvDate", todayText())
-                    setText(pageView, "tvPeriod", "수업 정보 없음")
+            subjectCodes.forEach { subjectCode ->
+                FirebaseClient.get("Subjects/$subjectCode") { subjectJson ->
+                    synchronized(lock) {
+                        fetchCount++
+                        if (subjectJson != null) {
+                            val subCode = subjectJson.optString("subjectCode", subjectCode)
+                            val subName = subjectJson.optString("subjectName", "알 수 없는 과목")
+                            val profName = subjectJson.optString("professorName", "미정")
+                            val scheduleObj = subjectJson.optJSONObject("schedule")
 
-                    updateStudentAttendanceUi(
-                        pageView = pageView,
-                        statusText = "미출석",
-                        isCompleted = false
-                    )
-                    return@get
+                            if (scheduleObj != null) {
+                                val dayKeys = scheduleObj.keys()
+                                val allSchedulesForThisSubject = mutableListOf<String>()
+                                var representLocation = "미정"
+
+                                // 첫 번째 루프: 이 과목의 전체 시간표 문자열 만들기 (예: 월 10:00-11:50, 수 10:00-11:50)
+                                val dayKeysList = scheduleObj.keys().asSequence().toList()
+                                for (dayKey in dayKeysList) {
+                                    val dayObj = scheduleObj.optJSONObject(dayKey) ?: continue
+                                    val dayKr = when (dayObj.optString("dayOfWeek", "").uppercase()) {
+                                        "MONDAY"->"월"; "TUESDAY"->"화"; "WEDNESDAY"->"수"
+                                        "THURSDAY"->"목"; "FRIDAY"->"금"; "SATURDAY"->"토"; "SUNDAY"->"일"
+                                        else -> dayObj.optString("dayOfWeek", "")
+                                    }
+                                    if (representLocation == "미정") representLocation = dayObj.optString("location", "미정")
+
+                                    val periodsArr = dayObj.optJSONArray("periods")
+                                    var sTime = ""; var eTime = ""
+                                    if (periodsArr != null) {
+                                        for (i in 0 until periodsArr.length()) {
+                                            val p = periodsArr.optJSONObject(i) ?: continue
+                                            if (sTime.isEmpty()) sTime = p.optString("startTime", "")
+                                            eTime = p.optString("endTime", "")
+                                        }
+                                    }
+                                    if (sTime.isNotEmpty() && eTime.isNotEmpty()) {
+                                        allSchedulesForThisSubject.add("$dayKr $sTime-$eTime")
+                                    }
+                                }
+                                val fullScheduleStr = allSchedulesForThisSubject.joinToString(", ")
+
+                                // 두 번째 루프: 가장 임박한 시간을 찾기 위해 요일별로 쪼개서 리스트에 담기
+                                for (dayKey in dayKeysList) {
+                                    val dayObj = scheduleObj.optJSONObject(dayKey) ?: continue
+                                    val dayOfWeekStr = dayObj.optString("dayOfWeek", "")
+                                    val dayInt = when (dayOfWeekStr.uppercase()) {
+                                        "MONDAY", "월" -> 1; "TUESDAY", "화" -> 2; "WEDNESDAY", "수" -> 3
+                                        "THURSDAY", "목" -> 4; "FRIDAY", "금" -> 5; "SATURDAY", "토" -> 6; "SUNDAY", "일" -> 7; else -> -1
+                                    }
+
+                                    if (dayInt != -1) {
+                                        val periodsArr = dayObj.optJSONArray("periods")
+                                        if (periodsArr != null) {
+                                            var firstStart: String? = null
+                                            var lastEnd: String? = null
+                                            for (i in 0 until periodsArr.length()) {
+                                                val p = periodsArr.optJSONObject(i) ?: continue
+                                                val st = p.optString("startTime", "")
+                                                val ed = p.optString("endTime", "")
+                                                if (st.isNotEmpty() && ed.isNotEmpty()) {
+                                                    if (firstStart == null) firstStart = st
+                                                    lastEnd = ed
+                                                }
+                                            }
+                                            if (firstStart != null && lastEnd != null) {
+                                                allClasses.add(ClassInstance(subCode, subName, profName, representLocation, fullScheduleStr, dayInt, firstStart, lastEnd))
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (fetchCount == subjectCodes.size) {
+                            runOnUiThread {
+                                if (allClasses.isEmpty()) {
+                                    pageView.findViewById<TextView>(R.id.tvClassName)?.text = "등록된 수업 없음"
+                                    pageView.findViewById<TextView>(R.id.tvDetailClassName)?.text = "등록된 수업 없음"
+                                    return@runOnUiThread
+                                }
+
+                                val ongoingClass = allClasses.firstOrNull {
+                                    it.dayOfWeekInt == currentDayInt && nowStr >= it.startTime && nowStr <= it.endTime
+                                }
+
+                                val currentTotalMinutes = currentDayInt * 24 * 60 + timeToMinutes(nowStr)
+                                val upcomingClass = allClasses.minByOrNull {
+                                    var classMins = it.dayOfWeekInt * 24 * 60 + timeToMinutes(it.startTime)
+                                    if (classMins < currentTotalMinutes) classMins += 7 * 24 * 60
+                                    classMins
+                                }
+
+                                val targetClass = ongoingClass ?: upcomingClass
+                                if (targetClass == null) return@runOnUiThread
+
+                                currentSubjectCode = targetClass.subjectCode
+                                currentClassName = targetClass.subjectName
+                                currentClassStartTime = targetClass.startTime
+                                currentClassTime = "${targetClass.startTime} ~ ${targetClass.endTime}"
+
+                                val startHour = currentClassStartTime.substringBefore(":").toIntOrNull() ?: 10
+                                val periodNumber = when (startHour) {
+                                    9->"1교시"; 10->"2교시"; 11->"3교시"; 12->"4교시"; 13->"5교시"; 14->"6교시"; 15->"7교시"; 16->"8교시"; else->"1교시"
+                                }
+
+                                val dayKr = when (targetClass.dayOfWeekInt) { 1->"월"; 2->"화"; 3->"수"; 4->"목"; 5->"금"; 6->"토"; 7->"일"; else->"" }
+                                val periodText = if (ongoingClass != null) "수업 중" else "($dayKr) $periodNumber 예정"
+
+                                pageView.findViewById<TextView>(R.id.tvClassName)?.text = currentClassName
+                                pageView.findViewById<TextView>(R.id.tvClassTime)?.text = currentClassTime
+                                pageView.findViewById<TextView>(R.id.tvPeriod)?.text = periodText
+
+                                pageView.findViewById<TextView>(R.id.tvDetailClassName)?.text = currentClassName
+                                pageView.findViewById<TextView>(R.id.tvDetailProfessor)?.text = targetClass.profName
+                                pageView.findViewById<TextView>(R.id.tvDetailTime)?.text = targetClass.fullScheduleStr
+                                pageView.findViewById<TextView>(R.id.tvDetailRoom)?.text = targetClass.location
+
+                                updateStudentAttendanceUi(pageView, "미출석", false)
+                                setupStudentAttendanceButton(pageView)
+                            }
+                        }
+                    }
                 }
-
-                val firstSchedule = subject.schedules.firstOrNull()
-                val firstPeriod = firstSchedule?.periods?.firstOrNull()
-                val lastPeriod = firstSchedule?.periods?.lastOrNull()
-
-                currentClassName = subject.subjectName
-                currentClassStartTime = firstPeriod?.startTime ?: "10:00"
-                currentClassTime = "${firstPeriod?.startTime ?: "10:00"} ~ ${lastPeriod?.endTime ?: "10:50"}"
-
-                setText(pageView, "tvDate", todayText())
-                setText(pageView, "tvPeriod", "1교시")
-
-                updateStudentAttendanceUi(
-                    pageView = pageView,
-                    statusText = "미출석",
-                    isCompleted = false
-                )
             }
         }
     }
@@ -367,126 +442,102 @@ class MainActivity : Activity() {
         val btnAttendance = pageView.findViewById<Button?>(R.id.btnAttendance) ?: return
         setAttendanceButtonInactive(btnAttendance)
 
-        attendanceRefreshRunnable?.let { handler.removeCallbacks(it) }
-        attendanceRefreshRunnable = object : Runnable {
-            override fun run() {
-                if (currentPageResId == R.layout.main1) {
-                    refreshStudentAttendanceButtonState(pageView)
-                    handler.postDelayed(this, 3000L)
-                }
-            }
-        }
-        handler.postDelayed(attendanceRefreshRunnable!!, 500L)
-    }
-
-    private fun refreshStudentAttendanceButtonState(pageView: View) {
-        val btnAttendance = pageView.findViewById<Button?>(R.id.btnAttendance) ?: return
         val today = apiDateText()
+        if (currentSubjectCode.isBlank()) currentSubjectCode = DEFAULT_SUBJECT_CODE
 
-        if (currentSubjectCode.isBlank()) {
-            currentSubjectCode = DEFAULT_SUBJECT_CODE
+        val database = FirebaseDatabase.getInstance().reference
+        activeRecordRef = database.child("Attendance_Records").child(currentSubjectCode).child(today).child(userId)
+
+        attendanceRecordListener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (currentPageResId != R.layout.main1) return
+
+                val currentStatus = snapshot.child("finalStatus").getValue(String::class.java) ?: ""
+
+                when (currentStatus) {
+                    "출석", "출석 완료", "異쒖꽍" -> {
+                        setAttendanceButtonCompleted(btnAttendance)
+                        updateStudentAttendanceUi(pageView, "출석 완료", true)
+                        btnAttendance.setOnClickListener { Toast.makeText(this@MainActivity, "이미 출석 처리되었습니다", Toast.LENGTH_SHORT).show() }
+                        removeSessionListener() // 출석 완료 시 더 이상 세션 관찰 안함
+                    }
+                    "결석", "寃곗꽍" -> {
+                        setAttendanceButtonInactive(btnAttendance)
+                        updateStudentAttendanceUi(pageView, "결석", false)
+                        btnAttendance.setOnClickListener { Toast.makeText(this@MainActivity, "결석 처리되었습니다", Toast.LENGTH_SHORT).show() }
+                        removeSessionListener()
+                    }
+                    "지각" -> {
+                        setAttendanceButtonInactive(btnAttendance)
+                        updateStudentAttendanceUi(pageView, "지각", false)
+                        btnAttendance.setOnClickListener { Toast.makeText(this@MainActivity, "지각 처리되었습니다", Toast.LENGTH_SHORT).show() }
+                        removeSessionListener()
+                    }
+                    else -> {
+                        updateStudentAttendanceUi(pageView, "미출석", false)
+                        observeSessionStatus(pageView, btnAttendance, today)
+                    }
+                }
+            }
+            override fun onCancelled(error: DatabaseError) {}
         }
-
-        FirebaseClient.get("Attendance_Records/$currentSubjectCode/$today/$userId") { recordJson ->
-            val currentStatus = recordJson?.optString("finalStatus", "") ?: ""
-
-            if (
-                currentStatus == "출석" ||
-                currentStatus == "출석 완료" ||
-                currentStatus == "異쒖꽍"
-            ) {
-                setAttendanceButtonCompleted(btnAttendance)
-
-                updateStudentAttendanceUi(
-                    pageView = pageView,
-                    statusText = "출석 완료",
-                    isCompleted = true
-                )
-
-                btnAttendance.setOnClickListener {
-                    Toast.makeText(this, "이미 출석 처리되었습니다", Toast.LENGTH_SHORT).show()
-                }
-                return@get
-            }
-
-            if (
-                currentStatus == "결석" ||
-                currentStatus == "寃곗꽍"
-            ) {
-                setAttendanceButtonInactive(btnAttendance)
-
-                updateStudentAttendanceUi(
-                    pageView = pageView,
-                    statusText = "결석",
-                    isCompleted = false
-                )
-
-                btnAttendance.setOnClickListener {
-                    Toast.makeText(this, "결석 처리되었습니다", Toast.LENGTH_SHORT).show()
-                }
-                return@get
-            }
-
-            if (currentStatus == "지각") {
-                setAttendanceButtonInactive(btnAttendance)
-
-                updateStudentAttendanceUi(
-                    pageView = pageView,
-                    statusText = "지각",
-                    isCompleted = false
-                )
-
-                btnAttendance.setOnClickListener {
-                    Toast.makeText(this, "지각 처리되었습니다", Toast.LENGTH_SHORT).show()
-                }
-                return@get
-            }
-
-            updateStudentAttendanceUi(
-                pageView = pageView,
-                statusText = "미출석",
-                isCompleted = false
-            )
-
-            refreshStudentAttendanceSessionState(pageView, btnAttendance, today)
-        }
+        activeRecordRef?.addValueEventListener(attendanceRecordListener!!)
     }
 
-    private fun refreshStudentAttendanceSessionState(pageView: View, btnAttendance: Button, today: String) {
-        FirebaseClient.get("Attendance_Session/$currentSubjectCode/$today") { sessionJson ->
-            if (sessionJson == null) {
-                setAttendanceButtonInactive(btnAttendance)
-                btnAttendance.setOnClickListener {
-                    Toast.makeText(this, "출석체크 시간이 아닙니다", Toast.LENGTH_SHORT).show()
+    private fun observeSessionStatus(pageView: View, btnAttendance: Button, today: String) {
+        if (activeSessionRef != null) return // 이미 리스너가 작동 중이면 패스
+
+        val database = FirebaseDatabase.getInstance().reference
+        activeSessionRef = database.child("Attendance_Session").child(currentSubjectCode).child(today)
+
+        attendanceSessionListener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                if (currentPageResId != R.layout.main1) return
+
+                if (!snapshot.exists()) {
+                    setAttendanceButtonInactive(btnAttendance)
+                    btnAttendance.setOnClickListener { Toast.makeText(this@MainActivity, "출석체크 시간이 아닙니다", Toast.LENGTH_SHORT).show() }
+                    return
                 }
-                return@get
+
+                val status = snapshot.child("status").getValue(String::class.java) ?: "READY"
+                val bluetoothEndAt = snapshot.child("bluetoothEndAt").getValue(Long::class.java) ?: 0L
+                val pinEndAt = snapshot.child("pinEndAt").getValue(Long::class.java) ?: 0L
+                val classStartAt = snapshot.child("classStartAt").getValue(Long::class.java) ?: 0L
+                val now = System.currentTimeMillis()
+
+                if (status == "BLUETOOTH_ACTIVE" && now <= bluetoothEndAt) {
+                    setAttendanceButtonActive(btnAttendance)
+                    btnAttendance.setOnClickListener { startBluetoothAttendanceScan() }
+                } else if (now in (bluetoothEndAt + 1)..pinEndAt) {
+                    setAttendanceButtonInactive(btnAttendance)
+
+                    val sessionJson = JSONObject().apply {
+                        put("status", status)
+                        put("classStartAt", classStartAt)
+                        put("pinEndAt", pinEndAt)
+                    }
+                    btnAttendance.setOnClickListener { checkStudentPinEligibilityAndShow(pageView, sessionJson) }
+                } else {
+                    setAttendanceButtonInactive(btnAttendance)
+                    btnAttendance.setOnClickListener { Toast.makeText(this@MainActivity, "출석체크 시간이 아닙니다", Toast.LENGTH_SHORT).show() }
+                }
             }
-
-            val now = System.currentTimeMillis()
-            val status = sessionJson.optString("status", "READY")
-            val bluetoothEndAt = sessionJson.optLong("bluetoothEndAt", 0L)
-            val pinEndAt = sessionJson.optLong("pinEndAt", 0L)
-
-            if (status == "BLUETOOTH_ACTIVE" && now <= bluetoothEndAt) {
-                setAttendanceButtonActive(btnAttendance)
-                btnAttendance.setOnClickListener {
-                    startBluetoothAttendanceScan()
-                }
-                return@get
-            }
-
-            setAttendanceButtonInactive(btnAttendance)
-
-            if (now > bluetoothEndAt && now <= pinEndAt) {
-                btnAttendance.setOnClickListener {
-                    checkStudentPinEligibilityAndShow(pageView, sessionJson)
-                }
-            } else {
-                btnAttendance.setOnClickListener {
-                    Toast.makeText(this, "출석체크 시간이 아닙니다", Toast.LENGTH_SHORT).show()
-                }
-            }
+            override fun onCancelled(error: DatabaseError) {}
         }
+        activeSessionRef?.addValueEventListener(attendanceSessionListener!!)
+    }
+
+    private fun removeRecordListener() {
+        attendanceRecordListener?.let { activeRecordRef?.removeEventListener(it) }
+        attendanceRecordListener = null
+        activeRecordRef = null
+    }
+
+    private fun removeSessionListener() {
+        attendanceSessionListener?.let { activeSessionRef?.removeEventListener(it) }
+        attendanceSessionListener = null
+        activeSessionRef = null
     }
 
     private fun setAttendanceButtonActive(button: Button) {
@@ -510,11 +561,6 @@ class MainActivity : Activity() {
         button.alpha = 1.0f
     }
 
-    /**
-     * BLE phase student flow:
-     *   교수 Service가 광고 중인 sessionCode를 학생 Service가 BLE scan으로 찾고,
-     *   찾은 code로 server /check-in을 호출한다.
-     */
     private fun startBluetoothAttendanceScan() {
         if (userId.isBlank()) {
             Toast.makeText(this, "로그인 정보가 없습니다", Toast.LENGTH_SHORT).show()
@@ -526,18 +572,21 @@ class MainActivity : Activity() {
 
     private fun checkStudentPinEligibilityAndShow(pageView: View, sessionJson: JSONObject) {
         if (pinPopupShowing) return
-
         val today = apiDateText()
 
         FirebaseClient.get("Attendance_Records/$currentSubjectCode/$today/$userId") { recordJson ->
             val currentStatus = recordJson?.optString("finalStatus", "결석") ?: "결석"
 
             if (currentStatus == "출석" || currentStatus == "출석 완료") {
-                Toast.makeText(this, "이미 출석 처리되었습니다", Toast.LENGTH_SHORT).show()
+                runOnUiThread {
+                    Toast.makeText(this, "이미 출석 처리되었습니다", Toast.LENGTH_SHORT).show()
+                }
                 return@get
             }
 
-            showPinDialog(pageView, sessionJson)
+            runOnUiThread {
+                showPinDialog(pageView, sessionJson)
+            }
         }
     }
 
@@ -604,9 +653,6 @@ class MainActivity : Activity() {
                 return@setOnClickListener
             }
 
-            // 통합 후: 클라 PIN 검증 / Firebase PUT 제거.
-            // server가 sessionCode 검증 (잘못된 PIN이면 onAttendanceFailed) + dual-write.
-            // 출석/결석 판정도 server가 시간 기반으로 결정 (BLE 페이즈/PIN 페이즈 + classStartAt+10min).
             launcher.submitPin(userId, inputPin)
             dialog.dismiss()
         }
@@ -618,57 +664,23 @@ class MainActivity : Activity() {
         dialog.show()
     }
 
-    private fun savePinAttendance(pageView: View, finalStatus: String, onComplete: () -> Unit) {
-        val today = apiDateText()
-
-        val body = JSONObject()
-            .put("finalStatus", finalStatus)
-            .put("authMethod", "PIN")
-            .put("missedCount", 0)
-            .put("checkedAt", System.currentTimeMillis())
-
-        FirebaseClient.put("Attendance_Records/$currentSubjectCode/$today/$userId", body) {
-            updateStudentAttendanceUi(
-                pageView = pageView,
-                statusText = if (finalStatus == "출석") "출석 완료" else finalStatus,
-                isCompleted = finalStatus == "출석"
-            )
-
-            onComplete()
-            refreshStudentAttendanceButtonState(pageView)
-        }
-    }
-
-    /**
-     * 통합 후 동작:
-     *   - 클라가 Firebase Attendance_Session에 직접 PUT 안 함.
-     *   - launcher.startProfessor → server /start → server가 RTDB dual-write.
-     *   - 받은 PIN은 sessionListener.onSessionStarted 콜백으로 전달 → showPin 표시.
-     *   - BLE 광고 / UWB ranging은 우리 Service가 자동 진행 (5분 주기 등).
-     *   - 페이즈 UI 전환(After15+UWB 카드)은 classStartAt + 15min 시점에 클라 timer로 표시.
-     */
     private fun startAttendanceSession(pageView: View) {
         if (currentSubjectCode.isBlank()) {
             currentSubjectCode = DEFAULT_SUBJECT_CODE
         }
         val now = System.currentTimeMillis()
         val classStartAt = todayMillisFromTime(currentClassStartTime)
-        // TEST_ONLY: professor PIN card switches after attendance start + 1 minute.
-        // Restore to classStartAt + FIFTEEN_MINUTES for normal runs.
-        val pinEndAt = now + 60 * 1000L
 
-        // 출석 Service 시작 (권한/UWB feature 체크는 launcher 내부에서)
+        val pinEndAt = now + FIFTEEN_MINUTES
+
         launcher.startProfessor(currentSubjectCode, userId, classStartAt)
 
-        // 페이즈 UI 전환 timer — classStartAt + 15min 기준 (수업 시작 + 15분).
-        // 교수가 시작 누른 시점이 아니라 수업 시작 시각이 기준.
         val delayToAfter15 = (pinEndAt - now).coerceAtLeast(0L)
         phaseTransitionRunnable?.let { handler.removeCallbacks(it) }
         phaseTransitionRunnable = Runnable { transitionToAfter15Phase(pageView) }
         handler.postDelayed(phaseTransitionRunnable!!, delayToAfter15)
     }
 
-    /** 수업 시작 + 15분 시점에 클라 측에서만 카드 전환 (서버/RTDB WRITE 없음). */
     private fun transitionToAfter15Phase(pageView: View) {
         findChildByIdName<View>(pageView, "cardProfessorControlBefore15")?.visibility = View.GONE
         findChildByIdName<View>(pageView, "cardProfessorControlAfter15")?.visibility = View.VISIBLE
@@ -679,50 +691,6 @@ class MainActivity : Activity() {
         btnRollCall?.alpha = 0.4f
         btnProfessorAttendanceCheck?.isEnabled = false
         btnProfessorAttendanceCheck?.alpha = 0.4f
-    }
-
-    /**
-     * dual-write 통합 후: 사용 안 함 (RTDB status 전환은 시간 기반으로 자연 계산).
-     * 본문 주석 처리만 — 함수 시그니처/호출 자리는 향후 참조용으로 보존.
-     */
-    private fun expireBluetoothAndOpenPin(pageView: View) {
-        /*
-        val today = apiDateText()
-
-        FirebaseClient.get("Attendance_Session/$currentSubjectCode/$today") { sessionJson ->
-            if (sessionJson == null) return@get
-
-            val body = sessionJson
-                .put("status", "PIN_ACTIVE")
-
-            FirebaseClient.put("Attendance_Session/$currentSubjectCode/$today", body) {
-                Toast.makeText(this, "블루투스 출석이 종료되고 PIN 입력이 시작되었습니다", Toast.LENGTH_SHORT).show()
-                updateProfessorSessionUi(pageView, body)
-            }
-        }
-        */
-    }
-
-    /**
-     * dual-write 통합 후: 사용 안 함. 페이즈 UI 전환은 transitionToAfter15Phase가 담당.
-     */
-    private fun finishPinAndShowUwb(pageView: View) {
-        /*
-        val today = apiDateText()
-
-        FirebaseClient.get("Attendance_Session/$currentSubjectCode/$today") { sessionJson ->
-            if (sessionJson == null) return@get
-
-            val body = sessionJson
-                .put("status", "UWB_ACTIVE")
-
-            FirebaseClient.put("Attendance_Session/$currentSubjectCode/$today", body) {
-                updateProfessorSessionUi(pageView, body)
-                loadProfessorPage(pageView)
-                startUwbLoop(pageView)
-            }
-        }
-        */
     }
 
     private fun loadProfessorPage(pageView: View) {
@@ -742,24 +710,30 @@ class MainActivity : Activity() {
                 currentClassStartTime = firstPeriod?.startTime ?: "10:00"
                 currentClassTime = "${firstPeriod?.startTime ?: "10:00"} ~ ${lastPeriod?.endTime ?: "10:50"}"
 
-                setText(pageView, "tvDate", todayText())
-                setText(pageView, "tvPeriod", "1교시")
-                setText(pageView, "tvClassName", currentClassName)
-                setText(pageView, "tvClassTime", subject?.schedules?.joinToString(" / ") {
-                    "${FirebaseParsers.convertDayToKorean(it.dayOfWeek)} ${it.periods.firstOrNull()?.startTime ?: ""}-${it.periods.lastOrNull()?.endTime ?: ""}"
-                } ?: currentClassTime)
+                runOnUiThread {
+                    setText(pageView, "tvDate", todayText())
+                    setText(pageView, "tvPeriod", "1교시")
+                    setText(pageView, "tvClassName", currentClassName)
+                    setText(pageView, "tvClassTime", subject?.schedules?.joinToString(" / ") {
+                        "${FirebaseParsers.convertDayToKorean(it.dayOfWeek)} ${it.periods.firstOrNull()?.startTime ?: ""}-${it.periods.lastOrNull()?.endTime ?: ""}"
+                    } ?: currentClassTime)
 
-                setText(pageView, "tvAfter15ClassName", currentClassName)
+                    setText(pageView, "tvAfter15ClassName", currentClassName)
+                }
             }
 
             val today = apiDateText()
 
             FirebaseClient.get("Attendance_Session/$firstSubjectCode/$today") { sessionJson ->
-                updateProfessorSessionUi(pageView, sessionJson)
+                runOnUiThread {
+                    updateProfessorSessionUi(pageView, sessionJson)
+                }
             }
 
             FirebaseClient.get("Attendance_Records/$firstSubjectCode") { recordsJson ->
-                loadProfessorRows(pageView, recordsJson)
+                runOnUiThread {
+                    loadProfessorRows(pageView, recordsJson)
+                }
             }
         }
     }
@@ -803,7 +777,6 @@ class MainActivity : Activity() {
             btnProfessorAttendanceCheck?.isEnabled = false
             btnProfessorAttendanceCheck?.alpha = 0.4f
             btnProfessorAttendanceCheck?.setBackgroundResource(R.drawable.bg_attendance_button_gray)
-            startUwbLoop(pageView)
         } else {
             cardBefore15?.visibility = View.VISIBLE
             cardAfter15?.visibility = View.GONE
@@ -821,71 +794,6 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * dual-write 통합 후: 사용 안 함. 진짜 UWB ranging은 ProfessorAttendanceService가 처리.
-     * 본문 주석 처리 — UI 카운터 표시는 추후 server broadcast로 대체 예정.
-     */
-    private fun startUwbLoop(pageView: View) {
-        /*
-        uwbRunnable?.let { handler.removeCallbacks(it) }
-
-        uwbRunnable = object : Runnable {
-            override fun run() {
-                runUwbCheck(pageView)
-                handler.postDelayed(this, FIVE_MINUTES)
-            }
-        }
-
-        handler.post(uwbRunnable!!)
-        */
-    }
-
-    private fun runUwbCheck(pageView: View) {
-        /*
-        val today = apiDateText()
-
-        FirebaseClient.get("Attendance_Session/$currentSubjectCode/$today") { sessionJson ->
-            val currentCount = sessionJson?.optInt("uwbCheckCount", 0) ?: 0
-            val nextCount = currentCount + 1
-
-            val updatedSession = (sessionJson ?: JSONObject())
-                .put("status", "UWB_ACTIVE")
-                .put("uwbCheckCount", nextCount)
-
-            FirebaseClient.put("Attendance_Session/$currentSubjectCode/$today", updatedSession) {
-                setText(pageView, "tvUwbCheckCount", "${nextCount}회")
-
-                FirebaseClient.get("Attendance_Records/$currentSubjectCode/$today") { recordsJson ->
-                    if (recordsJson == null) {
-                        loadProfessorPage(pageView)
-                        return@get
-                    }
-
-                    val keys = recordsJson.keys()
-
-                    while (keys.hasNext()) {
-                        val studentId = keys.next()
-                        val record = recordsJson.optJSONObject(studentId) ?: continue
-
-                        if (record.optString("finalStatus") == "출석") {
-                            val missedCount = record.optInt("missedCount", 0) + 1
-                            record.put("missedCount", missedCount)
-
-                            if (missedCount >= 3) {
-                                record.put("finalStatus", "결석")
-                            }
-
-                            FirebaseClient.put("Attendance_Records/$currentSubjectCode/$today/$studentId", record) {}
-                        }
-                    }
-
-                    loadProfessorPage(pageView)
-                }
-            }
-        }
-        */
-    }
-
     private fun loadProfessorRows(pageView: View, recordsJson: JSONObject?) {
         val rows = findChildByIdName<LinearLayout>(pageView, "layoutStudentAttendanceRows")
         rows?.removeAllViews()
@@ -896,6 +804,8 @@ class MainActivity : Activity() {
             var present = 0
             var late = 0
             var absent = 0
+
+            val studentList = mutableListOf<Triple<String, String, String>>()
 
             if (keys != null) {
                 while (keys.hasNext()) {
@@ -910,79 +820,58 @@ class MainActivity : Activity() {
                     when (status) {
                         "출석", "출석 완료" -> present++
                         "지각" -> late++
-                        "결석" -> absent++
-                        "미출석" -> absent++
+                        "결석", "미출석" -> absent++
                     }
 
-                    addStudentRow(pageView, user.userId, user.name, status)
+                    studentList.add(Triple(user.userId, user.name, status))
                 }
             }
 
             if (total == 0) total = 1
 
-            setText(pageView, "tvStudentCount", "총 ${total}명")
-            setText(pageView, "tvAttendanceRate", "${present * 100 / total}%")
-            setText(pageView, "tvLateRate", "${late * 100 / total}%")
-            setText(pageView, "tvAbsentRate", "${absent * 100 / total}%")
+            val finalTotal = total
+            val finalPresent = present
+            val finalLate = late
+            val finalAbsent = absent
+
+            runOnUiThread {
+                studentList.forEach { (studentId, name, status) ->
+                    addStudentRow(pageView, studentId, name, status)
+                }
+                setText(pageView, "tvStudentCount", "총 ${finalTotal}명")
+                setText(pageView, "tvAttendanceRate", "${finalPresent * 100 / finalTotal}%")
+                setText(pageView, "tvLateRate", "${finalLate * 100 / finalTotal}%")
+                setText(pageView, "tvAbsentRate", "${finalAbsent * 100 / finalTotal}%")
+            }
         }
     }
 
     private fun findLatestAttendanceStatus(recordsJson: JSONObject?, targetUserId: String): String {
         if (recordsJson == null) return "미출석"
-
         val dateKeys = recordsJson.keys()
         var result = "미출석"
-
         while (dateKeys.hasNext()) {
             val dateKey = dateKeys.next()
             val dateObject = recordsJson.optJSONObject(dateKey) ?: continue
             val userObject = dateObject.optJSONObject(targetUserId) ?: continue
             result = userObject.optString("finalStatus", "미출석")
         }
-
         return result
     }
 
     private fun addStudentRow(pageView: View, studentId: String, name: String, status: String) {
         val parent = findChildByIdName<LinearLayout>(pageView, "layoutStudentAttendanceRows") ?: return
-
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dpToPx(0), dpToPx(8), dpToPx(0), dpToPx(8))
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dpToPx(38)
-            )
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dpToPx(38))
         }
-
         row.addView(makeRowText(studentId, 1.45f))
         row.addView(makeRowText(name, 1.0f))
-
-        row.addView(
-            makeStatusIcon(
-                isVisible = status == "출석" || status == "출석 완료",
-                drawableResId = R.drawable.attendanceweek,
-                weight = 0.75f
-            )
-        )
-
-        row.addView(
-            makeStatusIcon(
-                isVisible = status == "결석" || status == "미출석",
-                drawableResId = R.drawable.absentweek,
-                weight = 0.75f
-            )
-        )
-
-        row.addView(
-            makeStatusIcon(
-                isVisible = status == "지각",
-                drawableResId = R.drawable.lateweek,
-                weight = 0.75f
-            )
-        )
-
+        row.addView(makeStatusIcon(status == "출석" || status == "출석 완료", R.drawable.attendanceweek, 0.75f))
+        row.addView(makeStatusIcon(status == "결석" || status == "미출석", R.drawable.absentweek, 0.75f))
+        row.addView(makeStatusIcon(status == "지각", R.drawable.lateweek, 0.75f))
         parent.addView(row)
     }
 
@@ -993,33 +882,19 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             includeFontPadding = false
             setTextColor(Color.parseColor("#222222"))
-            layoutParams = LinearLayout.LayoutParams(
-                0,
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                weight
-            )
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, weight)
         }
     }
 
     private fun makeStatusIcon(isVisible: Boolean, drawableResId: Int, weight: Float): FrameLayout {
         return FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                0,
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                weight
-            )
-
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, weight)
             val icon = ImageView(this@MainActivity).apply {
                 setImageResource(drawableResId)
                 scaleType = ImageView.ScaleType.CENTER_INSIDE
                 visibility = if (isVisible) View.VISIBLE else View.INVISIBLE
-                layoutParams = FrameLayout.LayoutParams(
-                    dpToPx(18),
-                    dpToPx(18),
-                    Gravity.CENTER
-                )
+                layoutParams = FrameLayout.LayoutParams(dpToPx(18), dpToPx(18), Gravity.CENTER)
             }
-
             addView(icon)
         }
     }
@@ -1033,40 +908,202 @@ class MainActivity : Activity() {
     }
 
     private fun loadSchedule(pageView: View) {
+        val etSubjectCodeInput = pageView.findViewById<EditText>(R.id.etSubjectCodeInput)
+        val btnAddSubject = pageView.findViewById<TextView>(R.id.btnAddSubject)
+
+        btnAddSubject?.setOnClickListener {
+            val inputCode = etSubjectCodeInput?.text.toString().trim()
+
+            if (inputCode.isEmpty()) {
+                Toast.makeText(this@MainActivity, "과목코드를 입력해주세요.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            val database = FirebaseDatabase.getInstance().reference
+            database.child("Subjects").child(inputCode).get().addOnSuccessListener { snapshot ->
+                if (snapshot.exists()) {
+                    database.child("Enrollment").child(userId).child(inputCode).setValue(true)
+                        .addOnSuccessListener {
+                            Toast.makeText(this@MainActivity, "과목($inputCode)이 성공적으로 추가되었습니다!", Toast.LENGTH_SHORT).show()
+                            etSubjectCodeInput?.text?.clear()
+                            loadSchedule(pageView)
+                        }
+                        .addOnFailureListener {
+                            Toast.makeText(this@MainActivity, "과목 추가에 실패했습니다. 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
+                        }
+                } else {
+                    Toast.makeText(this@MainActivity, "존재하지 않는 과목코드입니다.", Toast.LENGTH_SHORT).show()
+                }
+            }.addOnFailureListener {
+                Toast.makeText(this@MainActivity, "과목 확인 중 오류가 발생했습니다.", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        val parent = findChildByIdName<FrameLayout>(pageView, "classBlockLayer")
+        runOnUiThread { parent?.removeAllViews() }
+
         FirebaseClient.get("Enrollment/$userId") { enrollmentJson ->
             val subjectCodes = mutableListOf<String>()
             val keys = enrollmentJson?.keys()
-
             if (keys != null) {
-                while (keys.hasNext()) {
-                    subjectCodes.add(keys.next())
-                }
+                while (keys.hasNext()) subjectCodes.add(keys.next())
             }
 
-            val parent = findChildByIdName<FrameLayout>(pageView, "classBlockLayer")
-            parent?.removeAllViews()
-
             if (subjectCodes.isEmpty()) {
-                setText(pageView, "tvCurrentClassName", "등록된 시간표 없음")
+                runOnUiThread {
+                    setText(pageView, "tvCurrentClassName", "수강 신청 내역 없음")
+                    findChildByIdName<View>(pageView, "currentClassEmptyCard")?.visibility = View.VISIBLE
+                }
                 return@get
             }
 
-            subjectCodes.forEachIndexed { index, subjectCode ->
+            val subjects = mutableListOf<com.example.myapplication.model.domain.model.Subject>()
+            var fetchCount = 0
+            val lock = Any()
+
+            subjectCodes.forEach { subjectCode ->
                 FirebaseClient.get("Subjects/$subjectCode") { subjectJson ->
-                    val subject = FirebaseParsers.subject(subjectJson, subjectCode) ?: return@get
-                    val course = FirebaseParsers.subjectToCourse(subject)
+                    synchronized(lock) {
+                        fetchCount++
+                        if (subjectJson != null) {
+                            val subCode = subjectJson.optString("subjectCode", subjectCode)
+                            val subName = subjectJson.optString("subjectName", "알 수 없음")
+                            val profName = subjectJson.optString("professorName", "미정")
+                            val scheduleObj = subjectJson.optJSONObject("schedule")
 
-                    addCourseBlock(parent, course, index)
+                            val scheduleMap = mutableMapOf<String, com.example.myapplication.model.domain.model.DaySchedule>()
 
-                    if (index == 0) {
-                        setText(pageView, "tvCurrentClassName", subject.subjectName)
-                        setText(pageView, "tvDetailProfessor", subject.professorName)
-                        setText(pageView, "tvDetailRoom", course.classroom)
-                        setText(pageView, "tvDetailCourseCode", subject.subjectCode)
-                        setText(pageView, "tvDetailTime", subject.schedules.joinToString(" / ") {
-                            "${FirebaseParsers.convertDayToKorean(it.dayOfWeek)} ${it.periods.firstOrNull()?.startTime ?: ""}-${it.periods.lastOrNull()?.endTime ?: ""}"
-                        })
+                            if (scheduleObj != null) {
+                                val dayKeys = scheduleObj.keys()
+                                while (dayKeys.hasNext()) {
+                                    val dayName = dayKeys.next()
+                                    val dayObj = scheduleObj.optJSONObject(dayName) ?: continue
+                                    val dayOfWeekStr = dayObj.optString("dayOfWeek", dayName)
+                                    val locationStr = dayObj.optString("location", "미정")
+
+                                    val periodsList = mutableListOf<com.example.myapplication.model.domain.model.Period>()
+                                    val periodsArr = dayObj.optJSONArray("periods")
+                                    if (periodsArr != null) {
+                                        for (i in 0 until periodsArr.length()) {
+                                            val p = periodsArr.optJSONObject(i) ?: continue
+                                            val st = p.optString("startTime", "")
+                                            val ed = p.optString("endTime", "")
+                                            if (st.isNotEmpty() && ed.isNotEmpty()) {
+                                                periodsList.add(com.example.myapplication.model.domain.model.Period(st, ed))
+                                            }
+                                        }
+                                    }
+                                    if (periodsList.isNotEmpty()) {
+                                        scheduleMap[dayOfWeekStr] = com.example.myapplication.model.domain.model.DaySchedule(
+                                            dayOfWeek = dayOfWeekStr, location = locationStr, periods = periodsList
+                                        )
+                                    }
+                                }
+                            }
+                            subjects.add(
+                                com.example.myapplication.model.domain.model.Subject(
+                                    subjectCode = subCode, subjectName = subName, professorName = profName, schedule = scheduleMap
+                                )
+                            )
+                        }
+                        if (fetchCount == subjectCodes.size) {
+                            runOnUiThread { renderScheduleSubjects(pageView, parent, subjects) }
+                        }
                     }
+                }
+            }
+        }
+    }
+
+    private fun loadStudentScheduleFromRest(pageView: View) {
+        val etSubjectCodeInput = pageView.findViewById<EditText>(R.id.etSubjectCodeInput)
+        val btnAddSubject = pageView.findViewById<TextView>(R.id.btnAddSubject)
+
+        btnAddSubject?.setOnClickListener {
+            val inputCode = etSubjectCodeInput?.text.toString().trim()
+
+            if (inputCode.isEmpty()) {
+                Toast.makeText(this@MainActivity, "과목코드를 입력해주세요.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            val database: DatabaseReference = FirebaseDatabase.getInstance().reference
+
+            database.child("Subjects").child(inputCode).get().addOnSuccessListener { snapshot ->
+                if (snapshot.exists()) {
+                    database.child("Enrollment").child(userId).child(inputCode).setValue(true)
+                        .addOnSuccessListener {
+                            Toast.makeText(this@MainActivity, "과목($inputCode)이 추가되었습니다!", Toast.LENGTH_SHORT).show()
+                            etSubjectCodeInput?.text?.clear()
+                            loadStudentScheduleFromRest(pageView)
+                        }
+                        .addOnFailureListener {
+                            Toast.makeText(this@MainActivity, "과목 추가 실패. 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
+                        }
+                } else {
+                    Toast.makeText(this@MainActivity, "존재하지 않는 과목코드입니다.", Toast.LENGTH_SHORT).show()
+                }
+            }.addOnFailureListener {
+                Toast.makeText(this@MainActivity, "과목 확인 중 오류가 발생했습니다.", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        lifecycleScope.launch {
+            val parent = findChildByIdName<FrameLayout>(pageView, "classBlockLayer")
+
+            runOnUiThread {
+                parent?.removeAllViews()
+            }
+
+            try {
+                val subjects = repository.getEnrolledSubjects(userId)
+
+                runOnUiThread {
+                    renderScheduleSubjects(pageView, parent, subjects)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    private fun loadProfessorScheduleFromRest(pageView: View) {
+        lifecycleScope.launch {
+            val parent = findChildByIdName<FrameLayout>(pageView, "classBlockLayer")
+            parent?.removeAllViews()
+
+            try {
+                val subjects = repository.getSubjects()
+                renderScheduleSubjects(pageView, parent, subjects)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    private fun renderScheduleSubjects(pageView: View, parent: FrameLayout?, subjects: List<Subject>) {
+        if (parent == null) return
+        parent.post {
+            parent.removeAllViews()
+            if (subjects.isEmpty()) {
+                setText(pageView, "tvCurrentClassName", "등록된 시간표 없음")
+                findChildByIdName<View>(pageView, "currentClassEmptyCard")?.visibility = View.VISIBLE
+                return@post
+            }
+            findChildByIdName<View>(pageView, "currentClassEmptyCard")?.visibility = View.GONE
+
+            subjects.forEachIndexed { index, subject ->
+                addSubjectBlock(parent, subject, index)
+                if (index == 0) {
+                    setText(pageView, "tvCurrentClassName", subject.subjectName)
+                    setText(pageView, "tvDetailProfessor", subject.professorName)
+                    setText(pageView, "tvDetailRoom", subject.schedule.values.firstOrNull()?.location ?: "미정")
+                    setText(pageView, "tvDetailCourseCode", subject.subjectCode)
+                    setText(pageView, "tvDetailTime", subject.schedule.values.joinToString(" / ") {
+                        val dayKr = when(it.dayOfWeek.uppercase()) { "MONDAY"->"월"; "TUESDAY"->"화"; "WEDNESDAY"->"수"; "THURSDAY"->"목"; "FRIDAY"->"금"; else->it.dayOfWeek }
+                        val validP = it.periods.filterNotNull()
+                        "$dayKr ${validP.firstOrNull()?.startTime ?: ""}-${validP.lastOrNull()?.endTime ?: ""}"
+                    })
                 }
             }
         }
@@ -1075,7 +1112,6 @@ class MainActivity : Activity() {
     private fun loadMyPage(pageView: View) {
         FirebaseClient.get("Users/$userId") { userJson ->
             val user = FirebaseParsers.user(userJson, userId)
-
             if (userRole == "professor") {
                 setText(pageView, "tvProfessorName", user?.name ?: userName)
                 setText(pageView, "tvProfessorMajor", "소프트웨어학과")
@@ -1090,45 +1126,35 @@ class MainActivity : Activity() {
     private fun loadAttendanceCalendar(pageView: View) {
         FirebaseClient.get("Attendance_Records") { recordsRoot ->
             val result = StringBuilder()
-
             val subjectKeys = recordsRoot?.keys()
             if (subjectKeys != null) {
                 while (subjectKeys.hasNext()) {
                     val subjectCode = subjectKeys.next()
                     val subjectObject = recordsRoot.optJSONObject(subjectCode) ?: continue
                     val dateKeys = subjectObject.keys()
-
                     while (dateKeys.hasNext()) {
                         val date = dateKeys.next()
                         val userRecord = subjectObject.optJSONObject(date)?.optJSONObject(userId) ?: continue
-                        result.append(date)
-                            .append(" / ")
-                            .append(subjectCode)
-                            .append(" / ")
-                            .append(userRecord.optString("finalStatus", ""))
-                            .append("\n")
+                        result.append(date).append(" / ").append(subjectCode).append(" / ").append(userRecord.optString("finalStatus", "")).append("\n")
                     }
                 }
             }
-
-            setText(pageView, "tvAttendanceCalendar", result.toString())
-            addSimpleText(pageView, "layoutAttendanceCalendar", result.toString())
+            runOnUiThread {
+                setText(pageView, "tvAttendanceCalendar", result.toString())
+                addSimpleText(pageView, "layoutAttendanceCalendar", result.toString())
+            }
         }
     }
 
     private fun loadAttendanceSummary(pageView: View) {
         FirebaseClient.get("Attendance_Records") { recordsRoot ->
-            var present = 0
-            var late = 0
-            var absent = 0
-
+            var present = 0; var late = 0; var absent = 0
             val subjectKeys = recordsRoot?.keys()
             if (subjectKeys != null) {
                 while (subjectKeys.hasNext()) {
                     val subjectCode = subjectKeys.next()
                     val subjectObject = recordsRoot.optJSONObject(subjectCode) ?: continue
                     val dateKeys = subjectObject.keys()
-
                     while (dateKeys.hasNext()) {
                         val date = dateKeys.next()
                         val userRecord = subjectObject.optJSONObject(date)?.optJSONObject(userId) ?: continue
@@ -1140,68 +1166,98 @@ class MainActivity : Activity() {
                     }
                 }
             }
-
             val total = (present + late + absent).coerceAtLeast(1)
             val text = "출석 ${present * 100 / total}% / 지각 ${late * 100 / total}% / 결석 ${absent * 100 / total}%"
-
-            setText(pageView, "tvAttendanceSummary", text)
-            addSimpleText(pageView, "layoutAttendanceSummary", text)
+            runOnUiThread {
+                setText(pageView, "tvAttendanceSummary", text)
+                addSimpleText(pageView, "layoutAttendanceSummary", text)
+            }
         }
     }
 
-    private fun addCourseBlock(parent: FrameLayout?, course: Course, index: Int) {
-        if (parent == null) return
-
+    private fun addSubjectBlock(parent: FrameLayout, subject: Subject, index: Int) {
         val colors = listOf("#8FA2C7", "#B9AAA5", "#79B2B8", "#A7B58D", "#C39DA4")
         val color = colors[index % colors.size]
+        val cleanName = subject.subjectName.replace(" (영어강의)", "").replace(" (실시간화상강의)", "")
 
-        course.schedules.forEach { time ->
-            val block = TextView(this).apply {
-                text = course.name + "\n" + course.classroom
-                setTextColor(Color.WHITE)
-                textSize = 10f
-                gravity = Gravity.CENTER
-                setPadding(dpToPx(4), dpToPx(4), dpToPx(4), dpToPx(4))
-                setBackgroundColor(Color.parseColor(color))
+        val usableWidth = parent.width - parent.paddingStart - parent.paddingEnd
+        val columnWidth = if (usableWidth > 0) usableWidth / 5 else dpToPx(50)
+
+        subject.schedule.values.forEach { daySchedule ->
+            val location = daySchedule.location.ifEmpty { "미정" }
+            val dayIndex = when (daySchedule.dayOfWeek.uppercase()) {
+                "MONDAY", "월" -> 0; "TUESDAY", "화" -> 1; "WEDNESDAY", "수" -> 2;
+                "THURSDAY", "목" -> 3; "FRIDAY", "금" -> 4; else -> return@forEach
             }
 
-            val params = FrameLayout.LayoutParams(
-                getColumnWidth(parent),
-                getBlockHeight(time.startHour, time.endHour)
-            )
+            daySchedule.periods.forEach { period ->
+                if (period == null) return@forEach
 
-            params.leftMargin = getLeftMarginByDay(parent, time.day)
-            params.topMargin = getTopMarginByHour(time.startHour)
+                val block = TextView(this@MainActivity).apply {
+                    text = "$cleanName\n$location"
+                    setTextColor(Color.WHITE)
+                    textSize = 10f
+                    gravity = Gravity.CENTER
+                    setPadding(dpToPx(2), dpToPx(2), dpToPx(2), dpToPx(2))
+                    setBackgroundColor(Color.parseColor(color))
+                }
 
-            parent.addView(block, params)
+                val params = FrameLayout.LayoutParams(
+                    columnWidth,
+                    getBlockHeightByTime(period.startTime, period.endTime)
+                ).apply {
+                    leftMargin = dayIndex * columnWidth
+                    topMargin = getTopMarginByTime(period.startTime)
+                }
+                parent.addView(block, params)
+            }
         }
+    }
+
+    private fun getTopMarginByTime(startTimeStr: String): Int {
+        val parts = startTimeStr.split(":")
+        val hour = parts.getOrNull(0)?.toIntOrNull() ?: 9
+        val minute = parts.getOrNull(1)?.toIntOrNull() ?: 0
+        val totalMinutesFromBase = (hour * 60 + minute) - (9 * 60)
+        return dpToPx((totalMinutesFromBase * (52.0 / 60.0)).toInt())
+    }
+
+    private fun getBlockHeightByTime(startTimeStr: String, endTimeStr: String): Int {
+        val startParts = startTimeStr.split(":")
+        val startHour = startParts.getOrNull(0)?.toIntOrNull() ?: 9
+        val startMin = startParts.getOrNull(1)?.toIntOrNull() ?: 0
+
+        val endParts = endTimeStr.split(":")
+        val endHour = endParts.getOrNull(0)?.toIntOrNull() ?: 10
+        val endMin = endParts.getOrNull(1)?.toIntOrNull() ?: 0
+
+        var durationMinutes = (endHour * 60 + endMin) - (startHour * 60 + startMin)
+
+        if (durationMinutes % 60 == 50) {
+            durationMinutes += 10
+        } else if (durationMinutes % 60 == 45) {
+            durationMinutes += 15
+        }
+
+        return dpToPx((durationMinutes * (52.0 / 60.0)).toInt()).coerceAtLeast(dpToPx(20))
     }
 
     private fun addSimpleText(pageView: View, parentIdName: String, value: String) {
         val parent = findChildByIdName<LinearLayout>(pageView, parentIdName) ?: return
         parent.removeAllViews()
-        parent.addView(
-            TextView(this).apply {
-                text = value
-                textSize = 14f
-                setTextColor(Color.parseColor("#222222"))
-                setPadding(16, 12, 16, 12)
-            }
-        )
+        parent.addView(TextView(this).apply { text = value; textSize = 14f; setTextColor(Color.parseColor("#222222")); setPadding(16, 12, 16, 12) })
     }
 
     private fun todayMillisFromTime(time: String): Long {
         val parts = time.split(":")
         val hour = parts.getOrNull(0)?.toIntOrNull() ?: 10
         val minute = parts.getOrNull(1)?.toIntOrNull() ?: 0
-
         val calendar = Calendar.getInstance(Locale.KOREA)
         calendar.time = Date()
         calendar.set(Calendar.HOUR_OF_DAY, hour)
         calendar.set(Calendar.MINUTE, minute)
         calendar.set(Calendar.SECOND, 0)
         calendar.set(Calendar.MILLISECOND, 0)
-
         return calendar.timeInMillis
     }
 
@@ -1209,16 +1265,10 @@ class MainActivity : Activity() {
         findChildByIdName<TextView>(pageView, idName)?.text = value
     }
 
-    private fun updateStudentAttendanceUi(
-        pageView: View,
-        statusText: String,
-        isCompleted: Boolean
-    ) {
+    private fun updateStudentAttendanceUi(pageView: View, statusText: String, isCompleted: Boolean) {
         val ivCheckIcon = pageView.findViewById<ImageView?>(R.id.ivCheckIcon)
         val tvAttendanceStatus = pageView.findViewById<TextView?>(R.id.tvAttendanceStatus)
-
         tvAttendanceStatus?.text = statusText
-
         if (isCompleted) {
             ivCheckIcon?.setImageResource(R.drawable.mainblue)
             tvAttendanceStatus?.setTextColor(Color.parseColor(BLUE_ACTIVE))
@@ -1233,122 +1283,16 @@ class MainActivity : Activity() {
         return if (id != 0) pageView.findViewById(id) else null
     }
 
-    private fun getColumnWidth(parent: FrameLayout): Int {
-        val width = parent.width
-        return if (width > 0) width / 5 else (resources.displayMetrics.widthPixels - dpToPx(120)) / 5
-    }
+    private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
 
-    private fun getLeftMarginByDay(parent: FrameLayout, day: String): Int {
-        val columnWidth = getColumnWidth(parent)
-        return when (day) {
-            "월" -> columnWidth * 0
-            "화" -> columnWidth * 1
-            "수" -> columnWidth * 2
-            "목" -> columnWidth * 3
-            "금" -> columnWidth * 4
-            else -> 0
-        }
-    }
+    private fun todayText(): String = SimpleDateFormat("yyyy.MM.dd", Locale.KOREA).format(Date())
 
-    private fun getTopMarginByHour(hour: Int): Int {
-        val oneHourHeight = dpToPx(52)
-        return when (hour) {
-            9 -> oneHourHeight * 0
-            10 -> oneHourHeight * 1
-            11 -> oneHourHeight * 2
-            12 -> oneHourHeight * 3
-            13 -> oneHourHeight * 4
-            14 -> oneHourHeight * 5
-            15 -> oneHourHeight * 6
-            16 -> oneHourHeight * 7
-            else -> 0
-        }
-    }
-
-    private fun getBlockHeight(startHour: Int, endHour: Int): Int {
-        return ((endHour - startHour).coerceAtLeast(1)) * dpToPx(52)
-    }
-
-    private fun dpToPx(dp: Int): Int {
-        return (dp * resources.displayMetrics.density).toInt()
-    }
-
-    private fun todayText(): String {
-        return SimpleDateFormat("yyyy.MM.dd", Locale.KOREA).format(Date())
-    }
-
-    private fun apiDateText(): String {
-        return SimpleDateFormat("yyyy-MM-dd", Locale.KOREA).format(Date())
-    }
-
-    private fun updateLog(message: String) {
-        android.util.Log.d("UWB_DB_TEST", message)
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
-    }
-
-    /**
-     * dual-write 통합 후: 사용 안 함. 본문 주석 처리.
-     */
-    private fun testUwbMonitorAndDatabase() {
-        /*
-        updateLog("[테스트 4] UWB 모니터 ↔ 실제 DB 연동 테스트 시작...")
-
-        val testSubjectCode = "TEST_SUBJECT"
-        val testStudentId = "TEST_STUDENT_01"
-        val today = apiDateText()
-        val randomFailCount = (1..3).random()
-
-        // 1. 현재 DB 값 읽기
-        FirebaseClient.get("Attendance_Records/$testSubjectCode/$today/$testStudentId") { recordJson ->
-            val status = recordJson?.optString("finalStatus")
-            updateLog("[실시간 DB 감지] 현재 파이어베이스에 기록된 학생 상태: ${status ?: "아직 판별 안됨 (빈칸)"}")
-        }
-
-        // 2. 1분 간격으로 UWB 연결 실패 상황 테스트
-        for (i in 1..randomFailCount) {
-            handler.postDelayed({
-                updateLog("📡 앱에서 ${i}번째 연결 실패(false) 신호 발생!")
-
-                FirebaseClient.get("Attendance_Records/$testSubjectCode/$today/$testStudentId") { recordJson ->
-                    val currentRecord = recordJson ?: JSONObject()
-
-                    val missedCount = currentRecord.optInt("missedCount", 0) + 1
-
-                    val finalStatus = if (missedCount >= 3) {
-                        "결석"
-                    } else {
-                        currentRecord.optString("finalStatus", "출석")
-                    }
-
-                    val updatedRecord = currentRecord
-                        .put("finalStatus", finalStatus)
-                        .put("authMethod", "UWB")
-                        .put("missedCount", missedCount)
-                        .put("checkedAt", System.currentTimeMillis())
-
-                    FirebaseClient.put(
-                        "Attendance_Records/$testSubjectCode/$today/$testStudentId",
-                        updatedRecord
-                    ) {
-                        updateLog("[실시간 DB 감지] 현재 파이어베이스에 기록된 학생 상태: $finalStatus / UWB 실패 ${missedCount}회")
-                    }
-                }
-            }, 60000L * i)
-        }
-
-        // 3. 테스트 종료 로그
-        handler.postDelayed({
-            updateLog("[테스트 4] DB 연동 테스트 자동 종료.")
-        }, 60000L * randomFailCount + 5000L)
-        */
-    }
+    private fun apiDateText(): String = SimpleDateFormat("yyyy-MM-dd", Locale.KOREA).format(Date())
 
     private fun logout() {
         getSharedPreferences("LOGIN_INFO", MODE_PRIVATE).edit().clear().apply()
         getSharedPreferences("login_pref", MODE_PRIVATE).edit().clear().apply()
-
         Toast.makeText(this, "로그아웃되었습니다", Toast.LENGTH_SHORT).show()
-
         val intent = Intent(this, LoginActivity::class.java)
         intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         startActivity(intent)

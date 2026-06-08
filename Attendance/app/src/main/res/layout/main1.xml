@@ -109,6 +109,7 @@
                 android:paddingBottom="18dp">
 
                 <TextView
+                    android:id="@+id/tvClassName"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:fontFamily="@font/pretendard_bold"
@@ -131,6 +132,7 @@
                         android:tint="#555555" />
 
                     <TextView
+                        android:id="@+id/tvClassTime"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_marginStart="7dp"
@@ -189,6 +191,7 @@
                     android:orientation="vertical">
 
                     <TextView
+                        android:id="@+id/tvDetailClassName"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:fontFamily="@font/pretendard_bold"
@@ -198,6 +201,7 @@
                         android:textStyle="bold" />
 
                     <TextView
+                        android:id="@+id/tvDetailProfessor"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="1dp"
@@ -207,6 +211,7 @@
                         android:textSize="15sp" />
 
                     <TextView
+                        android:id="@+id/tvDetailTime"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="7dp"
@@ -216,6 +221,7 @@
                         android:textSize="15sp" />
 
                     <TextView
+                        android:id="@+id/tvDetailRoom"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="1dp"

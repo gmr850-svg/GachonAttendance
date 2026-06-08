@@ -1,6 +1,5 @@
 package com.example.myapplication
 
-import android.app.Activity
 import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
@@ -10,23 +9,31 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import com.example.myapplication.model.domain.model.Subject
+import com.example.myapplication.model.domain.model.Period
+import com.google.firebase.database.FirebaseDatabase
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 
-class RegisterScheduleActivity : Activity() {
+class RegisterScheduleActivity : AppCompatActivity() {
 
     private lateinit var etCourseCode: EditText
     private lateinit var btnAddClass: Button
     private lateinit var btnConfirmSchedule: Button
     private lateinit var classBlockLayer: FrameLayout
 
-    private val selectedCourses = mutableListOf<Course>()
+    private val selectedSubjects = mutableListOf<Subject>()
     private var userId: String = ""
+
+    private val database = FirebaseDatabase.getInstance().reference
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.register_schedule)
 
-        userId = getSharedPreferences("LOGIN_INFO", MODE_PRIVATE)
-            .getString("userId", "") ?: ""
+        userId = getSharedPreferences("LOGIN_INFO", MODE_PRIVATE).getString("userId", "") ?: ""
 
         etCourseCode = findViewById(R.id.etCourseCode)
         btnAddClass = findViewById(R.id.btnAddClass)
@@ -35,176 +42,166 @@ class RegisterScheduleActivity : Activity() {
 
         btnAddClass.setOnClickListener {
             val inputCode = etCourseCode.text.toString().trim()
-
             if (inputCode.isEmpty()) {
                 Toast.makeText(this, "과목 코드를 입력해주세요.", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-
-            lookupSubject(inputCode)
+            lookupAndAddSubject(inputCode)
         }
 
         btnConfirmSchedule.setOnClickListener {
-            if (selectedCourses.isEmpty()) {
+            if (selectedSubjects.isEmpty()) {
                 Toast.makeText(this, "최소 1개 이상의 수업을 추가해주세요.", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-
-            saveEnrollment()
-        }
-    }
-
-    private fun lookupSubject(subjectCode: String) {
-        FirebaseClient.get("Subjects/$subjectCode") { json ->
-            val subject = FirebaseParsers.subject(json, subjectCode)
-
-            if (subject == null) {
-                Toast.makeText(this, "등록되지 않은 과목 코드입니다.", Toast.LENGTH_SHORT).show()
-                return@get
+            if (userId.isBlank()) {
+                Toast.makeText(this, "로그인 정보가 없습니다.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
             }
-
-            val course = FirebaseParsers.subjectToCourse(subject)
-            addCourseIfPossible(course)
+            saveEnrollmentToFirebase()
         }
     }
 
-    private fun addCourseIfPossible(course: Course) {
-        if (selectedCourses.any { it.code == course.code }) {
-            Toast.makeText(this, "이미 추가된 과목입니다.", Toast.LENGTH_SHORT).show()
-            return
-        }
+    private fun lookupAndAddSubject(subjectCode: String) {
+        lifecycleScope.launch {
+            try {
+                val snapshot = database.child("Subjects").child(subjectCode).get().await()
+                val subject = snapshot.getValue(Subject::class.java)
 
-        if (hasTimeConflict(course)) {
-            Toast.makeText(this, "이미 등록된 수업과 시간이 겹칩니다.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        selectedCourses.add(course)
-        etCourseCode.text.clear()
-
-        addCourseToTimeTable(course)
-
-        Toast.makeText(this, course.name + " 수업이 추가되었습니다.", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun saveEnrollment() {
-        if (userId.isBlank()) {
-            Toast.makeText(this, "로그인 정보가 없습니다.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        saveNextEnrollment(0)
-    }
-
-    private fun saveNextEnrollment(index: Int) {
-        if (index >= selectedCourses.size) {
-            Toast.makeText(this, "시간표가 저장되었습니다.", Toast.LENGTH_SHORT).show()
-            startActivity(Intent(this, MainActivity::class.java))
-            finish()
-            return
-        }
-
-        val course = selectedCourses[index]
-
-        FirebaseClient.put("Enrollment/$userId/${course.code}", org.json.JSONObject().put("value", true)) {
-            FirebaseClient.put("Enrollment/$userId/${course.code}", org.json.JSONObject.NULL as? org.json.JSONObject ?: org.json.JSONObject()) {
-                FirebaseClient.putRawBoolean("Enrollment/$userId/${course.code}", true) {
-                    saveNextEnrollment(index + 1)
+                if (subject == null) {
+                    Toast.makeText(this@RegisterScheduleActivity, "등록되지 않은 과목 코드입니다.", Toast.LENGTH_SHORT).show()
+                    return@launch
                 }
+
+                if (selectedSubjects.any { it.subjectCode == subject.subjectCode }) {
+                    Toast.makeText(this@RegisterScheduleActivity, "이미 추가된 과목입니다.", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+
+                // 시간 겹침 체크
+                if (isTimeOverlapping(subject, selectedSubjects)) {
+                    Toast.makeText(this@RegisterScheduleActivity, "시간표가 겹치는 과목이 있습니다.", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+
+                selectedSubjects.add(subject)
+                drawSubjectBlock(subject, selectedSubjects.size - 1)
+
+                etCourseCode.text.clear()
+                Toast.makeText(this@RegisterScheduleActivity, "${subject.subjectName} 추가됨", Toast.LENGTH_SHORT).show()
+
+            } catch (e: Exception) {
+                Toast.makeText(this@RegisterScheduleActivity, "오류가 발생했습니다.", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
-    private fun addCourseToTimeTable(course: Course) {
-        val colors = listOf("#8FA2C7", "#B9AAA5", "#79B2B8", "#A7B58D", "#C39DA4")
-        val color = colors[(selectedCourses.size - 1) % colors.size]
-
-        for (time in course.schedules) {
-            val block = TextView(this).apply {
-                text = course.name + "\n" + course.classroom
-                setTextColor(Color.WHITE)
-                textSize = 10f
-                gravity = Gravity.CENTER
-                setPadding(dpToPx(4), dpToPx(4), dpToPx(4), dpToPx(4))
-                setBackgroundColor(Color.parseColor(color))
-            }
-
-            val params = FrameLayout.LayoutParams(
-                getColumnWidth(),
-                getBlockHeight(time.startHour, time.endHour)
-            )
-
-            params.leftMargin = getLeftMarginByDay(time.day)
-            params.topMargin = getTopMarginByHour(time.startHour)
-
-            classBlockLayer.addView(block, params)
-        }
-    }
-
-    private fun hasTimeConflict(newCourse: Course): Boolean {
-        for (selectedCourse in selectedCourses) {
-            for (selectedTime in selectedCourse.schedules) {
-                for (newTime in newCourse.schedules) {
-                    val sameDay = selectedTime.day == newTime.day
-                    val overlap = selectedTime.startHour < newTime.endHour &&
-                            newTime.startHour < selectedTime.endHour
-
-                    if (sameDay && overlap) {
-                        return true
+    private fun isTimeOverlapping(newSubject: Subject, currentSubjects: List<Subject>): Boolean {
+        for (newDayEntry in newSubject.schedule) {
+            val newDaySchedule = newDayEntry.value
+            for (currentSubject in currentSubjects) {
+                for (currentDayEntry in currentSubject.schedule) {
+                    val currentDaySchedule = currentDayEntry.value
+                    
+                    if (isSameDay(newDaySchedule.dayOfWeek, currentDaySchedule.dayOfWeek)) {
+                        for (newPeriod in newDaySchedule.periods) {
+                            if (newPeriod == null) continue
+                            for (currentPeriod in currentDaySchedule.periods) {
+                                if (currentPeriod == null) continue
+                                if (checkOverlap(newPeriod, currentPeriod)) {
+                                    return true
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-
         return false
     }
 
-    private fun getColumnWidth(): Int {
-        val width = classBlockLayer.width
-
-        return if (width > 0) {
-            width / 5
-        } else {
-            val screenWidth = resources.displayMetrics.widthPixels
-            val horizontalPadding = dpToPx(24 + 24 + 18 + 8 + 28)
-            (screenWidth - horizontalPadding) / 5
-        }
+    private fun isSameDay(day1: String, day2: String): Boolean {
+        val d1 = day1.lowercase()
+        val d2 = day2.lowercase()
+        // 요일 표기 형식이 다를 수 있으므로 변환 처리 (예: Monday <-> 월)
+        val normalized1 = normalizeDay(d1)
+        val normalized2 = normalizeDay(d2)
+        return normalized1 == normalized2
     }
 
-    private fun getLeftMarginByDay(day: String): Int {
-        val columnWidth = getColumnWidth()
-
+    private fun normalizeDay(day: String): String {
         return when (day) {
-            "월" -> columnWidth * 0
-            "화" -> columnWidth * 1
-            "수" -> columnWidth * 2
-            "목" -> columnWidth * 3
-            "금" -> columnWidth * 4
-            else -> 0
+            "monday", "월", "월요일" -> "mon"
+            "tuesday", "화", "화요일" -> "tue"
+            "wednesday", "수", "수요일" -> "wed"
+            "thursday", "목", "목요일" -> "thu"
+            "friday", "금", "금요일" -> "fri"
+            "saturday", "토", "토요일" -> "sat"
+            "sunday", "일", "일요일" -> "sun"
+            else -> day
         }
     }
 
-    private fun getTopMarginByHour(hour: Int): Int {
-        val oneHourHeight = dpToPx(52)
+    private fun checkOverlap(p1: Period, p2: Period): Boolean {
+        return p1.startTime < p2.endTime && p2.startTime < p1.endTime
+    }
 
-        return when (hour) {
-            9 -> oneHourHeight * 0
-            10 -> oneHourHeight * 1
-            11 -> oneHourHeight * 2
-            12 -> oneHourHeight * 3
-            13 -> oneHourHeight * 4
-            14 -> oneHourHeight * 5
-            15 -> oneHourHeight * 6
-            16 -> oneHourHeight * 7
-            else -> 0
+    private fun saveEnrollmentToFirebase() {
+        lifecycleScope.launch {
+            try {
+                for (subject in selectedSubjects) {
+                    database.child("Enrollment").child(userId).child(subject.subjectCode).setValue(true).await()
+                }
+                Toast.makeText(this@RegisterScheduleActivity, "시간표가 저장되었습니다.", Toast.LENGTH_SHORT).show()
+
+                startActivity(Intent(this@RegisterScheduleActivity, MainActivity::class.java))
+                finish()
+            } catch (e: Exception) {
+                Toast.makeText(this@RegisterScheduleActivity, "저장에 실패했습니다.", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
-    private fun getBlockHeight(startHour: Int, endHour: Int): Int {
-        return ((endHour - startHour).coerceAtLeast(1)) * dpToPx(52)
-    }
+    private fun drawSubjectBlock(subject: Subject, index: Int) {
+        val cleanName = subject.subjectName.replace(" (영어강의)", "").replace(" (실시간화상강의)", "")
 
-    private fun dpToPx(dp: Int): Int {
-        return (dp * resources.displayMetrics.density).toInt()
+        val colors = listOf("#8FA2C7", "#B9AAA5", "#79B2B8", "#A7B58D", "#C39DA4")
+        val color = colors[index % colors.size]
+
+        for ((_, daySchedule) in subject.schedule) {
+            val location = daySchedule.location.ifEmpty { "미정" }
+            val dayKr = when (normalizeDay(daySchedule.dayOfWeek.lowercase())) {
+                "mon" -> "월"; "tue" -> "화"; "wed" -> "수"; "thu" -> "목"; "fri" -> "금"; else -> continue
+            }
+
+            for (period in daySchedule.periods) {
+                if (period == null) continue
+
+                val startHour = period.startTime.substringBefore(":").toIntOrNull() ?: continue
+                val endHour = period.endTime.substringBefore(":").toIntOrNull() ?: continue
+
+                val block = TextView(this).apply {
+                    text = "$cleanName\n$location"
+                    setTextColor(Color.WHITE)
+                    textSize = 10f
+                    gravity = Gravity.CENTER
+                    setBackgroundColor(Color.parseColor(color))
+                    setPadding(4, 4, 4, 4)
+                }
+
+                val columnWidth = if (classBlockLayer.width > 0) classBlockLayer.width / 5 else (resources.displayMetrics.widthPixels - 200) / 5
+                val oneHourHeight = (52 * resources.displayMetrics.density).toInt()
+
+                val params = FrameLayout.LayoutParams(
+                    columnWidth,
+                    (endHour - startHour).coerceAtLeast(1) * oneHourHeight
+                ).apply {
+                    leftMargin = columnWidth * when (dayKr) { "월" -> 0; "화" -> 1; "수" -> 2; "목" -> 3; "금" -> 4; else -> 0 }
+                    topMargin = oneHourHeight * when (startHour) { in 9..16 -> startHour - 9; else -> 0 }
+                }
+
+                classBlockLayer.addView(block, params)
+            }
+        }
     }
 }
